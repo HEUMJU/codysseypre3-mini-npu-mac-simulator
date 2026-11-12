@@ -7,6 +7,7 @@ import time
 
 EPSILON = 1e-9
 REPEATS = 10
+WARMUP_REPEATS = 3
 
 
 def normalize_label(value):
@@ -67,20 +68,35 @@ def classify(score_cross, score_x):
     return "Cross" if difference > 0 else "X"
 
 
-def timed_average(function, pattern, filt, repeats=REPEATS):
-    start = time.perf_counter()
-    for _ in range(repeats):
+def classify_manual(score_a, score_b):
+    """Return the A/B vocabulary required by the interactive mode."""
+    difference = score_a - score_b
+    if abs(difference) < EPSILON:
+        return "판정 불가 (UNDECIDED)"
+    return "A" if difference > 0 else "B"
+
+
+def timed_stats(function, pattern, filt, repeats=REPEATS):
+    # Warm the interpreter and caches before collecting the reported samples.
+    for _ in range(WARMUP_REPEATS):
         function(pattern, filt)
-    return (time.perf_counter() - start) * 1000.0 / repeats
+    samples = []
+    for _ in range(repeats):
+        start = time.perf_counter()
+        function(pattern, filt)
+        samples.append((time.perf_counter() - start) * 1000.0)
+    average = sum(samples) / len(samples)
+    variance = sum((sample - average) ** 2 for sample in samples) / max(1, len(samples) - 1)
+    return average, math.sqrt(variance)
 
 
 def benchmark(size, repeats=REPEATS):
     cross = generate_pattern(size, "Cross")
     filt = generate_pattern(size, "Cross")
     flat_cross, flat_filt = flatten(cross), flatten(filt)
-    t2 = timed_average(mac_2d, cross, filt, repeats)
-    tf = timed_average(mac_flat, flat_cross, flat_filt, repeats)
-    return t2, tf
+    t2, sd2 = timed_stats(mac_2d, cross, filt, repeats)
+    tf, sdf = timed_stats(mac_flat, flat_cross, flat_filt, repeats)
+    return t2, sd2, tf, sdf
 
 
 def generate_pattern(size, label):
@@ -107,21 +123,27 @@ def read_matrix(label, size):
     while True:
         print("{}: {}개 행을 입력하세요 (각 행 {}개 숫자, 공백 구분)".format(label, size, size))
         matrix = []
-        try:
-            for i in range(size):
-                parts = input("  {}행> ".format(i + 1)).split()
-                if len(parts) != size:
-                    raise ValueError("입력 형식 오류: 각 줄에 {}개의 숫자를 공백으로 구분해 입력하세요.".format(size))
+        invalid = False
+        for i in range(size):
+            parts = input("  {}행> ".format(i + 1)).split()
+            if len(parts) != size:
+                print("입력 형식 오류: 각 줄에 {}개의 숫자를 공백으로 구분해 입력하세요.".format(size))
+                invalid = True
+                break
+            try:
                 row = [float(part) for part in parts]
-                if not all(math.isfinite(value) for value in row):
-                    raise ValueError("유한한 숫자만 입력할 수 있습니다.")
-                matrix.append(row)
+            except ValueError:
+                print("숫자 파싱 오류: 각 행에 유효한 숫자 {}개를 공백으로 구분해 입력하세요.".format(size))
+                invalid = True
+                break
+            if not all(math.isfinite(value) for value in row):
+                print("숫자 입력 오류: NaN이나 무한대가 아닌 유한한 숫자를 입력하세요.")
+                invalid = True
+                break
+            matrix.append(row)
+        if not invalid and len(matrix) == size:
             return matrix
-        except ValueError as exc:
-            print(str(exc) if "입력 형식 오류" in str(exc) else "입력 형식 오류: 숫자를 확인하세요. 각 줄에 {}개 숫자를 입력하세요.".format(size))
-            if len(matrix) < size:
-                # Finish consuming the remaining rows only when the error was caused mid-matrix.
-                pass
+        else:
             print("행렬 전체를 처음부터 다시 입력합니다.")
 
 
@@ -133,11 +155,12 @@ def mode_manual():
     start = time.perf_counter()
     score_a, score_b = mac_2d(pattern, filt_a), mac_2d(pattern, filt_b)
     elapsed = (time.perf_counter() - start) * 1000.0
-    decision = classify(score_a, score_b)
+    decision = classify_manual(score_a, score_b)
     print("점수 A: {:.12g} | 점수 B: {:.12g}".format(score_a, score_b))
     print("연산 시간: {:.6f} ms | 판정: {}".format(elapsed, decision))
-    t2, tf = benchmark(3)
-    print("성능 분석 ({}회 평균): 3x3 2차원 {:.6f} ms, 1차원 {:.6f} ms, MAC 9회".format(REPEATS, t2, tf))
+    t2, sd2, tf, sdf = benchmark(3)
+    print("성능 분석 (워밍업 {}회 후 {}회 평균±표준편차): 3x3 2차원 {:.6f}±{:.6f} ms, 1차원 {:.6f}±{:.6f} ms, MAC 9회".format(
+        WARMUP_REPEATS, REPEATS, t2, sd2, tf, sdf))
 
 
 def load_json(path):
@@ -200,11 +223,12 @@ def mode_json(path):
             print("{} | FAIL ({})".format(case_id, reason))
             outcomes.append((case_id, "FAIL", reason))
 
-    print("\n[성능 분석: {}회 반복 평균]".format(REPEATS))
-    print("크기(N×N) | 2차원 평균(ms) | 1차원 평균(ms) | MAC 연산 횟수(N²)")
+    print("\n[성능 분석: 워밍업 {}회 후 {}회 반복 평균±표준편차]".format(WARMUP_REPEATS, REPEATS))
+    print("크기(N×N) | 2차원 평균±표준편차(ms) | 1차원 평균±표준편차(ms) | MAC 연산 횟수(N²)")
     for size in (3, 5, 13, 25):
-        t2, tf = benchmark(size)
-        print("{:>2}×{:<2} | {:>14.6f} | {:>14.6f} | {:>16}".format(size, size, t2, tf, size * size))
+        t2, sd2, tf, sdf = benchmark(size)
+        print("{:>2}×{:<2} | {:>10.6f}±{:<10.6f} | {:>10.6f}±{:<10.6f} | {:>16}".format(
+            size, size, t2, sd2, tf, sdf, size * size))
     passed = sum(1 for _, status, _ in outcomes if status == "PASS")
     failed = len(outcomes) - passed
     print("\n[결과 요약] 전체 테스트: {} | 통과: {} | 실패: {}".format(len(outcomes), passed, failed))
